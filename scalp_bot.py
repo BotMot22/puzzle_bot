@@ -36,6 +36,8 @@ from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY
+from web3 import Web3
+from eth_account import Account
 
 # ═══════════════════════════════════════════════════════════════
 # CREDENTIALS
@@ -54,6 +56,57 @@ clob_client = ClobClient(
 )
 
 # ═══════════════════════════════════════════════════════════════
+# ON-CHAIN REDEMPTION (auto-redeem winning shares for USDC)
+# ═══════════════════════════════════════════════════════════════
+_w3 = Web3(Web3.HTTPProvider("https://polygon.drpc.org"))
+_acct = Account.from_key(os.environ["POLYMARKET_PRIVATE_KEY"])
+_CTF = _w3.eth.contract(
+    address=_w3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"),
+    abi=json.loads('[{"inputs":[{"name":"collateralToken","type":"address"},{"name":"parentCollectionId","type":"bytes32"},{"name":"conditionId","type":"bytes32"},{"name":"indexSets","type":"uint256[]"}],"name":"redeemPositions","outputs":[],"stateMutability":"nonpayable","type":"function"}]'),
+)
+_COLLATERAL = _w3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+_PARENT = b'\x00' * 32
+
+
+def redeem_positions():
+    """Redeem all resolved positions on-chain so USDC returns to wallet."""
+    try:
+        wallet = os.environ["POLYMARKET_WALLET"]
+        positions = requests.get(
+            f"https://data-api.polymarket.com/positions?user={wallet}"
+        ).json()
+        redeemable = [p for p in positions if p.get("redeemable")]
+        if not redeemable:
+            return
+
+        nonce = _w3.eth.get_transaction_count(_acct.address, "latest")
+        gas_price = _w3.eth.gas_price
+
+        for p in redeemable:
+            cid = p["conditionId"]
+            try:
+                tx = _CTF.functions.redeemPositions(
+                    _COLLATERAL, _PARENT, bytes.fromhex(cid[2:]), [1, 2]
+                ).build_transaction({
+                    "from": _acct.address,
+                    "nonce": nonce,
+                    "gas": 250000,
+                    "maxFeePerGas": gas_price * 2,
+                    "maxPriorityFeePerGas": _w3.to_wei(50, "gwei"),
+                    "chainId": 137,
+                })
+                signed = _acct.sign_transaction(tx)
+                tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
+                _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                print(f"  [REDEEM] {p['outcome']} {p['size']:.2f} shares | {p['title'][:45]}")
+                nonce += 1
+            except Exception as e:
+                pass  # skip failed redemptions silently
+    except Exception:
+        pass  # don't crash bot on redemption errors
+
+
+# ═══════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 BET_SIZE = 5.00
@@ -68,7 +121,7 @@ WINDOW_SECS = 300
 S1_ASSETS = ["BTC", "ETH"]
 S2_ASSETS = ["BTC"]
 
-STARTING_BANKROLL = 23.81
+STARTING_BANKROLL = 24.39
 KILL_SWITCH_MIN = 5.00   # Stop trading if bankroll drops below this
 LOG_FILE = "data/scalp_trades.csv"
 STATE_FILE = "data/scalp_state.json"
@@ -395,6 +448,7 @@ def run():
                     state["windows"] += 1
                     print_dashboard(state)
                     save_state(state)
+                    redeem_positions()
 
                 current_window_ts = window_ts
                 ctx = WindowCtx(window_ts=window_ts, window_end=window_end)

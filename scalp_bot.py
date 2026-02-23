@@ -163,7 +163,9 @@ def log_trade(trade: dict):
 def execute_trade(state, strat_key, ctx, asset, side, ask_price):
     """LIVE trade: place real FOK order on Polymarket CLOB."""
     s = state[strat_key]
-    shares = round(BET_SIZE / ask_price, 2)
+    # CLOB requires clean decimals — use integer shares to avoid floating point issues
+    ask_price = round(ask_price, 2)
+    shares = int(BET_SIZE / ask_price)  # floor to whole shares, keeps maker_amt clean
     binance_sym = BINANCE_MAP[asset]
     spot = get_binance_price(binance_sym)
     open_px = ctx.btc_open if asset == "BTC" else ctx.eth_open

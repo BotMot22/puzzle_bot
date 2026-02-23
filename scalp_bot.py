@@ -109,7 +109,7 @@ def redeem_positions():
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
-BET_SIZE = 5.00
+BET_SIZE = 10.00
 MIN_ASK = 0.98
 MAX_ASK = 0.995   # Don't buy at $1.00 — zero profit. Allows $0.98 and $0.99.
 BTC_BUFFER = 25.0
@@ -121,7 +121,7 @@ WINDOW_SECS = 300
 S1_ASSETS = ["BTC", "ETH"]
 S2_ASSETS = ["BTC"]
 
-STARTING_BANKROLL = 24.39
+STARTING_BANKROLL = 24.00
 KILL_SWITCH_MIN = 5.00   # Stop trading if bankroll drops below this
 LOG_FILE = "data/scalp_trades.csv"
 STATE_FILE = "data/scalp_state.json"
@@ -250,6 +250,7 @@ def execute_trade(state, strat_key, ctx, asset, side, ask_price):
 
     # Order filled — record it
     order_id = resp.get("orderID", "")
+    actual_cost = round(shares * ask_price, 2)  # what we actually paid
     trade = {
         "strategy": strat_key,
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -257,9 +258,9 @@ def execute_trade(state, strat_key, ctx, asset, side, ask_price):
         "asset": asset,
         "side": side,
         "ask_price": ask_price,
-        "bet_size": BET_SIZE,
+        "bet_size": actual_cost,
         "shares": round(shares, 4),
-        "potential_profit": round(shares - BET_SIZE, 4),
+        "potential_profit": round(shares - actual_cost, 4),
         "open_price": open_px,
         "price_at_trade": spot,
         "price_delta": round(delta, 2),
@@ -268,14 +269,14 @@ def execute_trade(state, strat_key, ctx, asset, side, ask_price):
 
     s["pending"].append(trade)
     s["trades"] += 1
-    s["bankroll"] -= BET_SIZE
+    s["bankroll"] -= actual_cost
 
     log_trade(trade)
 
     print(f"\n  >>> LIVE TRADE [{strat_name}] {asset} {side} @ ${ask_price:.3f}")
     print(f"      Order: {order_id[:16]}...")
-    print(f"      Bet: ${BET_SIZE:.2f} | Shares: {shares:.3f} | "
-          f"Profit if win: ${shares - BET_SIZE:.4f}")
+    print(f"      Cost: ${actual_cost:.2f} | Shares: {shares} | "
+          f"Profit if win: ${shares - actual_cost:.2f}")
     print(f"      {asset} open: ${open_px:,.2f} | now: ${spot:,.2f} | "
           f"delta: ${delta:+,.2f}")
     print(f"      Bankroll: ${s['bankroll']:,.2f} | "

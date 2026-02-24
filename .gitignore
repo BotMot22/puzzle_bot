@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+data/
+logs/
+pids/
+build/
+BitCrack/
+*.tmp
+*.so
+*.dll
+FOUND_KEY*.txt
+PUBKEY_FOUND.txt
+btc_puzzle_env/
+iceland_secp256k1/
+.env

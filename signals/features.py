@@ -227,4 +227,6 @@ def get_feature_columns(df: pd.DataFrame) -> list:
                "close_time", "quote_volume", "num_trades",
                "taker_buy_volume", "taker_buy_quote_volume",
                "fwd_ret", "target", "fwd_vol", "ignore"}
-    return [c for c in df.columns if c not in exclude]
+    # Exclude logret_ columns (redundant with ret_ and add noise to model)
+    return [c for c in df.columns
+            if c not in exclude and not c.startswith("logret_")]

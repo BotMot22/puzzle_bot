@@ -145,7 +145,7 @@ def get_binance_price(symbol: str) -> float:
         r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}",
                          timeout=5)
         return float(r.json()["price"])
-    except:
+    except Exception:
         return 0.0
 
 
@@ -258,8 +258,21 @@ def load_state() -> dict:
 
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2, default=str)
+    """Atomic write: write to tmp file, then rename (POSIX atomic)."""
+    import tempfile
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(STATE_FILE) or ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(state, f, indent=2, default=str)
+        os.replace(tmp_path, STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 # ═══════════════════════════════════════════════════════════════

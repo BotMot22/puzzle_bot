@@ -281,7 +281,7 @@ def get_ask(token_id: str) -> float:
             timeout=2,
         )
         return float(r.json().get("price", 0))
-    except:
+    except Exception:
         return 0.0
 
 
@@ -333,8 +333,21 @@ def load_state() -> dict:
 
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2, default=str)
+    """Atomic write: write to tmp file, then rename (POSIX atomic)."""
+    import tempfile
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(STATE_FILE) or ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(state, f, indent=2, default=str)
+        os.replace(tmp_path, STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def init_log():
@@ -376,7 +389,7 @@ def execute_trade(state, strat_key, ctx, asset, side, ask_price):
     token_id = mkt["up_token"] if side == "UP" else mkt["down_token"]
 
     # Place real order (Fill-or-Kill)
-    strat_name = "S1:Last15s" if strat_key == "s1" else "S2:30s+BTC"
+    strat_name = "S1:ML45s" if strat_key == "s1" else "S2:60s+BTC"
     try:
         order_args = OrderArgs(
             token_id=token_id,
@@ -435,7 +448,7 @@ def execute_trade(state, strat_key, ctx, asset, side, ask_price):
 # ═══════════════════════════════════════════════════════════════
 
 def check_s1(state, ctx, asset, up_ask, dn_ask):
-    """Strategy 1: Enter $0.85-$0.95 when ML prob > ask + 3% edge."""
+    """Strategy 1: Enter $0.75-$0.95 when ML prob > ask + 2% edge."""
     s = state["s1"]
     if s["bankroll"] < BET_SIZE or s["bankroll"] < KILL_SWITCH_MIN:
         return
@@ -560,8 +573,8 @@ def resolve_trades(state, now):
 
 def print_banner():
     print("=" * 70)
-    print("  SCALP BOT v4 — ML EDGE at $0.85-$0.95")
-    print("  S1: ML Edge (BTC/ETH/SOL/XRP)  |  S2: ML Edge+BTC Confirm")
+    print("  SCALP BOT v5 — ML EDGE at $0.75-$0.95")
+    print("  S1: ML Edge last 45s (BTC/ETH/SOL/XRP)  |  S2: ML Edge+BTC last 60s")
     print(f"  Bet: ${BET_SIZE:.2f} fixed  |  Ask: ${MIN_ASK:.2f}-${MAX_ASK:.2f}  |  "
           f"Min edge: {MIN_EDGE:.0%}")
     print(f"  S1: last {S1_LEAD}s  |  S2: last {S2_LEAD}s  |  "
@@ -580,7 +593,7 @@ def print_dashboard(state):
           f"{'W':>4} {'L':>4} {'WR':>7} {'Trades':>7}")
     print(f"  {'-'*66}")
 
-    for key, name in [("s1", "S1: Last 15s"), ("s2", "S2: 30s+BTC Confirm")]:
+    for key, name in [("s1", "S1: ML Edge 45s"), ("s2", "S2: 60s+BTC Confirm")]:
         s = state[key]
         w, l = s["wins"], s["losses"]
         wr = w / max(w + l, 1)
@@ -624,7 +637,8 @@ def run():
                     state["windows"] += 1
                     print_dashboard(state)
                     save_state(state)
-                    redeem_positions()
+                    # NOTE: redeem_positions() removed — handled by redeem_monitor
+                    # tmux session to avoid nonce race conditions on Polygon
                     retrain_models(state["windows"])
 
                 current_window_ts = window_ts

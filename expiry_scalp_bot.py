@@ -255,6 +255,11 @@ def scan_markets() -> list:
         if liq < MIN_LIQUIDITY:
             continue
 
+        # Skip soccer/football spreads — 2hr+ oracle resolution kills capital efficiency
+        question = m.get("question", "")
+        if "Spread:" in question:
+            continue
+
         prices = json.loads(m.get("outcomePrices", "[]"))
         outcomes = json.loads(m.get("outcomes", "[]"))
         tokens = json.loads(m.get("clobTokenIds", "[]"))
@@ -369,6 +374,10 @@ def scan_watchlist() -> list:
             continue
         liq = float(m.get("liquidityNum", 0) or 0)
         if liq < MIN_LIQUIDITY:
+            continue
+
+        question = m.get("question", "")
+        if "Spread:" in question:
             continue
 
         prices = json.loads(m.get("outcomePrices", "[]"))

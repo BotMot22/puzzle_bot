@@ -94,11 +94,12 @@ def redeem_positions():
                 signed = _acct.sign_transaction(tx)
                 tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
                 _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-                print(f"  [REDEEM] {p['outcome']} {p['size']:.2f} shares | {p['title'][:50]}")
+                size = float(p.get('size', 0))
+                print(f"  [REDEEM] {p.get('outcome', '?')} {size:.2f} shares | {p.get('title', '?')[:50]}")
                 nonce += 1
                 redeemed += 1
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"  [REDEEM FAIL] {p.get('outcome', '?')}: {e}")
         return redeemed
     except Exception:
         return 0
@@ -172,8 +173,21 @@ def load_state() -> dict:
 
 
 def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2, default=str)
+    """Atomic write: write to tmp file, then rename (POSIX atomic)."""
+    import tempfile
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(STATE_FILE) or ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(state, f, indent=2, default=str)
+        os.replace(tmp_path, STATE_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def init_log():
@@ -444,9 +458,15 @@ def execute_trade(state, candidate, clob_ask, clob_bid):
     state["bankroll"] -= actual_cost
     state["traded_tokens"].append(token_id)
 
-    # Keep traded_tokens bounded
+    # Keep traded_tokens bounded — but protect pending trade tokens
     if len(state["traded_tokens"]) > 500:
-        state["traded_tokens"] = state["traded_tokens"][-250:]
+        pending_tokens = {t["token_id"] for t in state["pending"]}
+        keep = [t for t in state["traded_tokens"] if t in pending_tokens]
+        non_pending = [t for t in state["traded_tokens"] if t not in pending_tokens]
+        state["traded_tokens"] = keep + non_pending[-250:]
+
+    # Persist immediately — real money was just spent
+    save_state(state)
 
     log_trade(trade)
 
@@ -481,20 +501,22 @@ def resolve_trades(state):
             f"https://data-api.polymarket.com/positions?user={wallet}",
             timeout=15,
         ).json()
-    except Exception:
+    except Exception as e:
+        print(f"  [WARN] Data API unavailable for resolution: {e}")
         return
 
-    # Build lookup: condition_id -> position data
+    # Build lookup: token_id -> position data (not conditionId, which
+    # can collide if wallet holds both sides of the same condition)
     pos_map = {}
     for p in positions:
-        cid = p.get("conditionId", "")
-        if cid:
-            pos_map[cid] = p
+        tid = p.get("asset", "") or p.get("tokenId", "")
+        if tid:
+            pos_map[tid] = p
 
     still_pending = []
     for t in state["pending"]:
-        cid = t.get("condition_id", "")
-        pos = pos_map.get(cid)
+        tid = t.get("token_id", "")
+        pos = pos_map.get(tid)
 
         # Check if resolved (redeemable or curValue indicates settlement)
         if pos and pos.get("redeemable"):
@@ -529,8 +551,8 @@ def resolve_trades(state):
             try:
                 end = datetime.fromisoformat(t["end_date"].replace("Z", "+00:00"))
                 age = (datetime.now(timezone.utc) - end).total_seconds()
-                if age > 86400:  # > 24h past end date, likely lost
-                    print(f"  [STALE] Marking as loss (>24h): {t['question'][:50]}")
+                if age > 259200:  # > 72h past end date — oracle may be slow
+                    print(f"  [STALE] Marking as loss (>72h): {t['question'][:50]}")
                     pnl = -t["bet_size"]
                     state["losses"] += 1
                     state["pnl"] += pnl

@@ -109,12 +109,13 @@ def redeem_positions():
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
-# Compounding bet sizing: bet 20% of per-strategy bankroll
-# At 20%, a loss costs ~20% of bank. Need ~10 wins to recover 1 loss.
-# At $0.98 entry (2% edge), 10 wins is achievable between losses.
-BET_PCT = 0.20
+# Tiered bet sizing: step up as bankroll grows, step down on drawdowns
+BET_TIERS = [
+    (30.0, 15.00),   # bankroll >= $30 → $15 bets
+    (20.0, 10.00),   # bankroll >= $20 → $10 bets
+    (0.0,   5.00),   # default → $5 bets
+]
 BET_MIN = 5.00
-BET_MAX = 50.00     # liquidity ceiling — FOK won't fill above this reliably
 MIN_ASK = 0.98
 MAX_ASK = 0.995   # Don't buy at $1.00 — zero profit. Allows $0.98 and $0.99.
 BTC_BUFFER = 25.0
@@ -126,7 +127,7 @@ WINDOW_SECS = 300
 S1_ASSETS = ["BTC", "ETH"]
 S2_ASSETS = ["BTC"]
 
-STARTING_BANKROLL = 30.85  # $61.71 wallet split across 2 strategies
+STARTING_BANKROLL = 30.85  # wallet split across 2 strategies
 KILL_SWITCH_MIN = 5.00   # Stop trading if bankroll drops below this
 LOG_FILE = "data/scalp_trades.csv"
 STATE_FILE = "data/scalp_state.json"
@@ -221,8 +222,12 @@ def log_trade(trade: dict):
 def execute_trade(state, strat_key, ctx, asset, side, ask_price):
     """LIVE trade: place real FOK order on Polymarket CLOB."""
     s = state[strat_key]
-    # Compounding: bet 40% of bankroll, clamped to min/max
-    bet_size = min(max(round(s["bankroll"] * BET_PCT, 2), BET_MIN), BET_MAX)
+    # Tiered bet sizing based on current bankroll
+    bet_size = BET_MIN
+    for threshold, size in BET_TIERS:
+        if s["bankroll"] >= threshold:
+            bet_size = size
+            break
     # CLOB requires clean decimals — use integer shares to avoid floating point issues
     ask_price = round(ask_price, 2)
     shares = int(bet_size / ask_price)  # floor to whole shares, keeps maker_amt clean
@@ -398,7 +403,8 @@ def print_banner():
     print("=" * 70)
     print("  SCALP BOT — LIVE TRADING")
     print("  S1: Last 15 Seconds (BTC+ETH)  |  S2: 30s+BTC Confirm (BTC)")
-    print(f"  Bet: {int(BET_PCT*100)}% of bank (${BET_MIN:.0f}-${BET_MAX:.0f})  |  Min ask: ${MIN_ASK:.2f}")
+    tiers_str = " / ".join(f"≥${t:.0f}→${s:.0f}" for t, s in BET_TIERS)
+    print(f"  Bet tiers: {tiers_str}  |  Min ask: ${MIN_ASK:.2f}")
     print(f"  Bankroll: ${STARTING_BANKROLL:,.2f} / strategy")
     print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 70)

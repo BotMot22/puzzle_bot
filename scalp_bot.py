@@ -123,7 +123,10 @@ def redeem_positions():
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
-STATE_VERSION = 6
+STATE_VERSION = 7
+
+PAPER_TRADE = True            # True = simulate fills, False = real CLOB orders
+PAPER_BANKROLL = 1000.00      # Paper trading bankroll
 
 # Ask range — we'll buy when ask is in this range
 MIN_ASK = 0.60
@@ -153,7 +156,7 @@ CROSS_ASSET_MAX_ASK = 0.85    # target asset ask must be cheap
 CROSS_ASSET_ASSETS = ["SOL", "XRP"]  # assets that lag BTC
 
 # Risk management
-STARTING_BANKROLL = 30.85
+STARTING_BANKROLL = PAPER_BANKROLL if PAPER_TRADE else 30.85
 KILL_SWITCH_MIN = 5.00
 MAX_TRADES_PER_WINDOW = 2     # cap trades per window to limit exposure
 
@@ -395,7 +398,7 @@ def get_ask(token_id: str) -> float:
 # ═══════════════════════════════════════════════════════════════
 
 def execute_trade(state, ctx, asset, side, ask_price, signal_name):
-    """Place real FOK order on Polymarket CLOB."""
+    """Execute trade — paper or live depending on PAPER_TRADE flag."""
     s = state["s1"]
 
     if s["bankroll"] < BET_SIZE or s["bankroll"] < KILL_SWITCH_MIN:
@@ -411,28 +414,35 @@ def execute_trade(state, ctx, asset, side, ask_price, signal_name):
     open_px = ctx.open_prices.get(asset, 0)
     delta = spot - open_px if open_px > 0 else 0
 
-    mkt = ctx.markets[asset]
-    token_id = mkt["up_token"] if side == "UP" else mkt["down_token"]
+    mode_tag = "PAPER" if PAPER_TRADE else "LIVE"
+    order_id = ""
 
-    try:
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=ask_price,
-            size=shares,
-            side=BUY,
-        )
-        signed_order = clob_client.create_order(order_args)
-        resp = clob_client.post_order(signed_order, OrderType.FOK)
+    if PAPER_TRADE:
+        # Paper trade — simulate instant fill
+        order_id = f"paper-{int(time.time())}"
+    else:
+        # Real trade — place FOK order on CLOB
+        mkt = ctx.markets[asset]
+        token_id = mkt["up_token"] if side == "UP" else mkt["down_token"]
+        try:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=ask_price,
+                size=shares,
+                side=BUY,
+            )
+            signed_order = clob_client.create_order(order_args)
+            resp = clob_client.post_order(signed_order, OrderType.FOK)
 
-        if not resp or not resp.get("success"):
-            print(f"\n  [NOFILL] {asset} {side} @ ${ask_price:.3f} "
-                  f"({signal_name}) — {resp}")
+            if not resp or not resp.get("success"):
+                print(f"\n  [NOFILL] {asset} {side} @ ${ask_price:.3f} "
+                      f"({signal_name}) — {resp}")
+                return False
+            order_id = resp.get("orderID", "")
+        except Exception as e:
+            print(f"\n  [ERROR] Order failed: {e}")
             return False
-    except Exception as e:
-        print(f"\n  [ERROR] Order failed: {e}")
-        return False
 
-    order_id = resp.get("orderID", "")
     actual_cost = round(shares * ask_price, 2)
     trade = {
         "strategy": "s1",
@@ -459,8 +469,7 @@ def execute_trade(state, ctx, asset, side, ask_price, signal_name):
 
     log_trade(trade)
 
-    print(f"\n  >>> TRADE [{signal_name}] {asset} {side} @ ${ask_price:.3f}")
-    print(f"      Order: {order_id[:16]}...")
+    print(f"\n  >>> {mode_tag} TRADE [{signal_name}] {asset} {side} @ ${ask_price:.3f}")
     print(f"      Bet: ${actual_cost:.2f} | Shares: {shares} | "
           f"Profit if win: ${shares - actual_cost:.2f}")
     print(f"      {asset} open: ${open_px:,.2f} | now: ${spot:,.2f} | "
@@ -481,6 +490,10 @@ def check_momentum(state, ctx, asset, side, ask_price, secs_left):
     Trigger: ask rose >= $0.12 over last 20 seconds, current ask in range.
     """
     if (asset, side) in ctx.traded:
+        return False
+    # Never trade both sides of the same asset in one window
+    opp = "DOWN" if side == "UP" else "UP"
+    if (asset, opp) in ctx.traded:
         return False
     if ctx.trade_count >= MAX_TRADES_PER_WINDOW:
         return False
@@ -514,6 +527,9 @@ def check_calibration(state, ctx, asset, side, ask_price, secs_left):
     the ask price by our minimum edge.
     """
     if (asset, side) in ctx.traded:
+        return False
+    opp = "DOWN" if side == "UP" else "UP"
+    if (asset, opp) in ctx.traded:
         return False
     if ctx.trade_count >= MAX_TRADES_PER_WINDOW:
         return False
@@ -562,14 +578,14 @@ def check_cross_asset(state, ctx, asset, up_ask, dn_ask, secs_left):
         return False
 
     # BTC is pumping → buy lagging asset's UP side
-    if btc_pct_move > 0 and (asset, "UP") not in ctx.traded:
+    if btc_pct_move > 0 and (asset, "UP") not in ctx.traded and (asset, "DOWN") not in ctx.traded:
         if MIN_ASK <= up_ask <= CROSS_ASSET_MAX_ASK:
             print(f"  [SIG-C] CROSS-ASSET {asset} UP: btc_move={btc_pct_move:+.2f}% "
                   f"ask={up_ask:.3f} (lagging)")
             return execute_trade(state, ctx, asset, "UP", up_ask, "CROSS-ASSET")
 
     # BTC is dumping → buy lagging asset's DOWN side
-    if btc_pct_move < 0 and (asset, "DOWN") not in ctx.traded:
+    if btc_pct_move < 0 and (asset, "DOWN") not in ctx.traded and (asset, "UP") not in ctx.traded:
         if MIN_ASK <= dn_ask <= CROSS_ASSET_MAX_ASK:
             print(f"  [SIG-C] CROSS-ASSET {asset} DOWN: btc_move={btc_pct_move:+.2f}% "
                   f"ask={dn_ask:.3f} (lagging)")
@@ -669,8 +685,9 @@ def log_calibration_for_window(ctx):
 
 def print_banner():
     calib_count = len(_calib_data)
+    mode = "PAPER TRADING" if PAPER_TRADE else "LIVE TRADING"
     print("=" * 70)
-    print("  SCALP BOT v6 — MOMENTUM + CALIBRATION + CROSS-ASSET")
+    print(f"  SCALP BOT v6 — MOMENTUM + CALIBRATION + CROSS-ASSET  [{mode}]")
     print(f"  Assets: {', '.join(ASSETS)}")
     print(f"  Bet: ${BET_SIZE:.2f} fixed  |  Ask range: ${MIN_ASK:.2f}-${MAX_ASK:.2f}")
     print(f"  Signals: A=Momentum B=Calibration({calib_count} obs) C=Cross-Asset")
@@ -686,8 +703,9 @@ def print_dashboard(state):
     wr = w / max(w + l, 1)
     calib_count = len(_calib_data)
 
+    mode = "PAPER" if PAPER_TRADE else "LIVE"
     print(f"\n{'=' * 70}")
-    print(f"  DASHBOARD  |  {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}  |  "
+    print(f"  DASHBOARD [{mode}]  |  {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}  |  "
           f"Windows: {state['windows']}  |  Calibration: {calib_count} obs")
     print(f"{'=' * 70}")
     print(f"  Bankroll: ${s['bankroll']:>9,.2f}  |  PnL: ${s['pnl']:>+9,.2f}  |  "
@@ -726,7 +744,8 @@ def run():
                     state["windows"] += 1
                     print_dashboard(state)
                     save_state(state)
-                    redeem_positions()
+                    if not PAPER_TRADE:
+                        redeem_positions()
                     # Reload calibration data periodically
                     if state["windows"] % 20 == 0:
                         load_calibration()

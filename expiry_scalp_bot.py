@@ -79,9 +79,10 @@ def redeem_positions():
 
         for p in redeemable:
             cid = p["conditionId"]
+            cid_hex = cid[2:] if cid.startswith("0x") else cid
             try:
                 tx = _CTF.functions.redeemPositions(
-                    _COLLATERAL, _PARENT, bytes.fromhex(cid[2:]), [1, 2]
+                    _COLLATERAL, _PARENT, bytes.fromhex(cid_hex), [1, 2]
                 ).build_transaction({
                     "from": _acct.address,
                     "nonce": nonce,

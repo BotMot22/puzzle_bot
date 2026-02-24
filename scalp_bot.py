@@ -81,7 +81,8 @@ def redeem_positions():
     try:
         wallet = os.environ["POLYMARKET_WALLET"]
         positions = requests.get(
-            f"https://data-api.polymarket.com/positions?user={wallet}"
+            f"https://data-api.polymarket.com/positions?user={wallet}",
+            timeout=15,
         ).json()
         redeemable = [p for p in positions if p.get("redeemable")]
         if not redeemable:
@@ -92,9 +93,11 @@ def redeem_positions():
 
         for p in redeemable:
             cid = p["conditionId"]
+            # Strip 0x prefix if present, otherwise use as-is
+            cid_hex = cid[2:] if cid.startswith("0x") else cid
             try:
                 tx = _CTF.functions.redeemPositions(
-                    _COLLATERAL, _PARENT, bytes.fromhex(cid[2:]), [1, 2]
+                    _COLLATERAL, _PARENT, bytes.fromhex(cid_hex), [1, 2]
                 ).build_transaction({
                     "from": _acct.address,
                     "nonce": nonce,
@@ -106,12 +109,13 @@ def redeem_positions():
                 signed = _acct.sign_transaction(tx)
                 tx_hash = _w3.eth.send_raw_transaction(signed.raw_transaction)
                 _w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-                print(f"  [REDEEM] {p['outcome']} {p['size']:.2f} shares | {p['title'][:45]}")
+                size = float(p.get('size', 0))
+                print(f"  [REDEEM] {p['outcome']} {size:.2f} shares | {p.get('title', '?')[:45]}")
                 nonce += 1
             except Exception as e:
-                pass  # skip failed redemptions silently
-    except Exception:
-        pass  # don't crash bot on redemption errors
+                print(f"  [REDEEM FAIL] {p.get('outcome', '?')}: {e}")
+    except Exception as e:
+        print(f"  [REDEEM ERROR] {e}")
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -209,11 +213,13 @@ def retrain_models(window_count):
 
 
 def refresh_features():
-    """Refresh cached feature DataFrames (called at window open)."""
+    """Refresh cached feature DataFrames (called at window open).
+    Uses same 2-day lookback as init/retrain so feature distributions
+    match what the scaler was fit on."""
     for asset in list(_models.keys()):
         sym = BINANCE_MAP[asset]
         try:
-            df = fetch_klines(sym, lookback_days=1)
+            df = fetch_klines(sym, lookback_days=2)
             df = compute_features(df)
             _models[asset]["df"] = df
             _models[asset]["feature_cols"] = get_feature_columns(df)
@@ -245,7 +251,8 @@ def estimate_probability(asset):
     if m["model"] is not None:
         try:
             ml_prob = float(m["model"].predict_proba(X)[0, 1])
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] {asset} ML predict failed: {e}")
             ml_prob = 0.5
 
     # Heuristic probability
@@ -253,7 +260,8 @@ def estimate_probability(asset):
     if _heuristic is not None:
         try:
             h_prob = float(_heuristic.predict_proba(X)[0, 1])
-        except Exception:
+        except Exception as e:
+            print(f"  [WARN] {asset} heuristic predict failed: {e}")
             h_prob = 0.5
 
     # Ensemble

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-SCALP BOT v4 — ML EDGE at $0.85-$0.95
+SCALP BOT v5 — ML EDGE at $0.75-$0.95
 =======================================================================
 
 Strategy 1: "ML Edge"
-  - Enter when ask is $0.85-$0.95 AND ML prob > ask + 3% edge
+  - Enter when ask is $0.75-$0.95 AND ML prob > ask + 2% edge
   - Market identifies the likely winner, ML confirms it's underpriced
   - $5 fixed bets, last 45s, runs on BTC/ETH/SOL/XRP
 
@@ -121,12 +121,12 @@ def redeem_positions():
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
-STATE_VERSION = 4         # Auto-reset state when strategy changes
+STATE_VERSION = 5         # Auto-reset state when strategy changes
 
-MIN_ASK = 0.85            # Lower bound — market leans heavily
+MIN_ASK = 0.75            # Lower bound — wider range catches more action
 MAX_ASK = 0.95            # Upper bound — still decent profit margin
 BET_SIZE = 5.00           # Fixed $5 bets
-MIN_EDGE = 0.03           # Require ML prob > ask + 3%
+MIN_EDGE = 0.02           # Require ML prob > ask + 2%
 RETRAIN_EVERY = 50        # Retrain models every N windows (~4hrs)
 ENSEMBLE_ML_W = 0.7       # ML model weight in ensemble
 ENSEMBLE_H_W = 0.3        # Heuristic weight in ensemble

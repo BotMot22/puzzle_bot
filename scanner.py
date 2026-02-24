@@ -245,7 +245,7 @@ def monitor(total_checked, found, shutdown):
             f"Prob: {prob_str} | "
             f"Uptime: {timedelta(seconds=int(elapsed))}"
         )
-        print(status)
+        print(status, flush=True)
 
         last_count = current_count
         last_time = now
@@ -261,9 +261,12 @@ def monitor(total_checked, found, shutdown):
                 "probability": current_count / KEYSPACE,
             }
             try:
-                with open(STATS_FILE, 'w') as f:
+                import tempfile
+                fd, tmp = tempfile.mkstemp(dir=str(DATA_DIR), suffix='.tmp')
+                with os.fdopen(fd, 'w') as f:
                     json.dump(stats, f, indent=2)
-            except:
+                os.replace(tmp, str(STATS_FILE))
+            except Exception:
                 pass
             last_save = now
 

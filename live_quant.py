@@ -48,8 +48,8 @@ warnings.filterwarnings("ignore")
 # ═══════════════════════════════════════════════════════════════
 LOG_FILE = "data/trade_log.csv"
 STATE_FILE = "data/live_state.json"
-ASSETS = ["BTC", "ETH"]
-BINANCE_MAP = {"BTC": "BTCUSDT", "ETH": "ETHUSDT"}
+ASSETS = ["BTC", "ETH", "SOL", "XRP"]
+BINANCE_MAP = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "SOL": "SOLUSDT", "XRP": "XRPUSDT"}
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 

@@ -1,17 +1,16 @@
 #!/usr/bin/env python3
 """
-SCALP BOT — LIVE TRADING on Polymarket 5-Min Markets
+SCALP BOT v4 — ML EDGE at $0.85-$0.95
 =======================================================================
 
-Strategy 1: "Last 15 Seconds"
-  - Buy whichever side has ask >= $0.98 with <15s remaining
-  - Runs on BTC + ETH
-  - $5 fixed bet
+Strategy 1: "ML Edge"
+  - Enter when ask is $0.85-$0.95 AND ML prob > ask + 3% edge
+  - Market identifies the likely winner, ML confirms it's underpriced
+  - $5 fixed bets, last 45s, runs on BTC/ETH/SOL/XRP
 
-Strategy 2: "30s + BTC Confirmation"
-  - Buy at $0.98 when <30s left AND BTC is $25+ from window open price
-  - BTC only — directional confirmation required
-  - $5 fixed bet
+Strategy 2: "ML Edge + BTC Confirmation"
+  - Same as S1, plus BTC $25+ directional confirmation
+  - BTC only, last 60s
 
 LIVE TRADING with real USDC via Polymarket CLOB.
 """
@@ -22,8 +21,14 @@ import os
 import sys
 import json
 import traceback
+import warnings
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -31,6 +36,9 @@ from live_quant import (
     discover_market, get_binance_price,
     CLOB_API, BINANCE_MAP,
 )
+from signals.model import QuantModel, HeuristicScorer
+from signals.features import compute_features, get_feature_columns
+from data.fetcher import fetch_klines
 import requests
 from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
@@ -109,28 +117,35 @@ def redeem_positions():
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
-# Tiered bet sizing: step up as bankroll grows, step down on drawdowns
-BET_TIERS = [
-    (30.0, 15.00),   # bankroll >= $30 → $15 bets
-    (20.0, 10.00),   # bankroll >= $20 → $10 bets
-    (0.0,   5.00),   # default → $5 bets
-]
-BET_MIN = 5.00
-MIN_ASK = 0.98
-MAX_ASK = 0.995   # Don't buy at $1.00 — zero profit. Allows $0.98 and $0.99.
+STATE_VERSION = 4         # Auto-reset state when strategy changes
+
+MIN_ASK = 0.85            # Lower bound — market leans heavily
+MAX_ASK = 0.95            # Upper bound — still decent profit margin
+BET_SIZE = 5.00           # Fixed $5 bets
+MIN_EDGE = 0.03           # Require ML prob > ask + 3%
+RETRAIN_EVERY = 50        # Retrain models every N windows (~4hrs)
+ENSEMBLE_ML_W = 0.7       # ML model weight in ensemble
+ENSEMBLE_H_W = 0.3        # Heuristic weight in ensemble
+
 BTC_BUFFER = 25.0
-S1_LEAD = 15          # Strategy 1: last 15 seconds
-S2_LEAD = 30          # Strategy 2: last 30 seconds
-POLL_INTERVAL = 1.5   # seconds between polls in scalp zone
+S1_LEAD = 45              # Strategy 1: last 45 seconds
+S2_LEAD = 60              # Strategy 2: last 60 seconds
+POLL_INTERVAL = 1.5       # seconds between polls in scalp zone
 WINDOW_SECS = 300
 
-S1_ASSETS = ["BTC", "ETH"]
+S1_ASSETS = ["BTC", "ETH", "SOL", "XRP"]
 S2_ASSETS = ["BTC"]
 
 STARTING_BANKROLL = 30.85  # wallet split across 2 strategies
-KILL_SWITCH_MIN = 5.00   # Stop trading if bankroll drops below this
+KILL_SWITCH_MIN = 5.00     # Stop trading if bankroll drops below this
 LOG_FILE = "data/scalp_trades.csv"
 STATE_FILE = "data/scalp_state.json"
+
+# ═══════════════════════════════════════════════════════════════
+# MODEL CACHE (per-asset QuantModel + features)
+# ═══════════════════════════════════════════════════════════════
+_models = {}       # {asset: {"model": QuantModel, "feature_cols": [...], "df": df}}
+_heuristic = None  # HeuristicScorer instance
 
 LOG_FIELDS = [
     "strategy", "timestamp", "window_ts", "asset", "side",
@@ -138,6 +153,112 @@ LOG_FIELDS = [
     "open_price", "price_at_trade", "price_delta",
     "resolved", "exit_price", "won", "pnl", "bankroll_after",
 ]
+
+
+# ═══════════════════════════════════════════════════════════════
+# MODEL INIT / RETRAIN / PROBABILITY
+# ═══════════════════════════════════════════════════════════════
+
+def init_models():
+    """Train QuantModel per asset at startup (~2-3s per asset)."""
+    global _heuristic
+    _heuristic = HeuristicScorer()
+
+    for asset in S1_ASSETS:
+        sym = BINANCE_MAP[asset]
+        print(f"  [MODEL] Training {asset} ({sym})...")
+        try:
+            df = fetch_klines(sym, lookback_days=2)
+            df = compute_features(df)
+            fc = get_feature_columns(df)
+            clean = df.dropna(subset=fc + ["target"])
+            if len(clean) < 100:
+                print(f"  [MODEL] {asset}: only {len(clean)} bars, skipping ML")
+                _models[asset] = {"model": None, "feature_cols": fc, "df": df}
+                continue
+            model = QuantModel()
+            model.train(clean[fc], clean["target"])
+            _models[asset] = {"model": model, "feature_cols": fc, "df": df}
+            print(f"  [MODEL] {asset} ready ({len(clean)} bars)")
+        except Exception as e:
+            print(f"  [MODEL] {asset} training failed: {e}")
+            _models[asset] = {"model": None, "feature_cols": [], "df": None}
+
+
+def retrain_models(window_count):
+    """Every RETRAIN_EVERY windows, re-fetch data and retrain models."""
+    if window_count % RETRAIN_EVERY != 0 or window_count == 0:
+        return
+    print(f"\n  [RETRAIN] Window #{window_count} — retraining all models...")
+    for asset in list(_models.keys()):
+        sym = BINANCE_MAP[asset]
+        try:
+            df = fetch_klines(sym, lookback_days=2)
+            df = compute_features(df)
+            fc = get_feature_columns(df)
+            clean = df.dropna(subset=fc + ["target"])
+            if len(clean) < 100:
+                print(f"  [RETRAIN] {asset}: insufficient data ({len(clean)} bars)")
+                continue
+            model = QuantModel()
+            model.train(clean[fc], clean["target"])
+            _models[asset] = {"model": model, "feature_cols": fc, "df": df}
+            print(f"  [RETRAIN] {asset} done ({len(clean)} bars)")
+        except Exception as e:
+            print(f"  [RETRAIN] {asset} failed: {e}")
+
+
+def refresh_features():
+    """Refresh cached feature DataFrames (called at window open)."""
+    for asset in list(_models.keys()):
+        sym = BINANCE_MAP[asset]
+        try:
+            df = fetch_klines(sym, lookback_days=1)
+            df = compute_features(df)
+            _models[asset]["df"] = df
+            _models[asset]["feature_cols"] = get_feature_columns(df)
+        except Exception as e:
+            print(f"  [FEATURES] {asset} refresh failed: {e}")
+
+
+def estimate_probability(asset):
+    """
+    Ensemble P(UP) from ML model + heuristic.
+    Returns 0.5 (no edge) if model unavailable.
+    """
+    if asset not in _models or _models[asset]["df"] is None:
+        return 0.5
+
+    m = _models[asset]
+    fc = m["feature_cols"]
+    df = m["df"]
+
+    valid = df.dropna(subset=fc)
+    if valid.empty:
+        return 0.5
+
+    latest = valid.iloc[-1:]
+    X = latest[fc]
+
+    # ML probability
+    ml_prob = 0.5
+    if m["model"] is not None:
+        try:
+            ml_prob = float(m["model"].predict_proba(X)[0, 1])
+        except Exception:
+            ml_prob = 0.5
+
+    # Heuristic probability
+    h_prob = 0.5
+    if _heuristic is not None:
+        try:
+            h_prob = float(_heuristic.predict_proba(X)[0, 1])
+        except Exception:
+            h_prob = 0.5
+
+    # Ensemble
+    ens_prob = ENSEMBLE_ML_W * ml_prob + ENSEMBLE_H_W * h_prob
+    return ens_prob
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -164,8 +285,7 @@ def get_ask(token_id: str) -> float:
 class WindowCtx:
     window_ts: int
     window_end: int
-    btc_open: float = 0.0
-    eth_open: float = 0.0
+    open_prices: dict = field(default_factory=dict)  # {asset: price}
     markets: dict = field(default_factory=dict)
     s1_traded: set = field(default_factory=set)   # (asset, side) combos
     s2_traded: bool = False
@@ -189,8 +309,15 @@ def new_strategy_state():
 def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
-            return json.load(f)
+            data = json.load(f)
+        # Auto-reset if strategy version changed
+        if data.get("version") != STATE_VERSION:
+            print(f"  [STATE] Version mismatch (have {data.get('version')}, "
+                  f"need {STATE_VERSION}) — resetting state")
+        else:
+            return data
     return {
+        "version": STATE_VERSION,
         "s1": new_strategy_state(),
         "s2": new_strategy_state(),
         "windows": 0,
@@ -220,20 +347,20 @@ def log_trade(trade: dict):
 # ═══════════════════════════════════════════════════════════════
 
 def execute_trade(state, strat_key, ctx, asset, side, ask_price):
-    """LIVE trade: place real FOK order on Polymarket CLOB."""
+    """LIVE trade with fixed $5 bets: place real FOK order on Polymarket CLOB."""
     s = state[strat_key]
-    # Tiered bet sizing based on current bankroll
-    bet_size = BET_MIN
-    for threshold, size in BET_TIERS:
-        if s["bankroll"] >= threshold:
-            bet_size = size
-            break
-    # CLOB requires clean decimals — use integer shares to avoid floating point issues
+
+    if s["bankroll"] < BET_SIZE:
+        return
+
     ask_price = round(ask_price, 2)
-    shares = int(bet_size / ask_price)  # floor to whole shares, keeps maker_amt clean
+    shares = int(BET_SIZE / ask_price)  # floor to whole shares
+    if shares < 1:
+        return
+
     binance_sym = BINANCE_MAP[asset]
     spot = get_binance_price(binance_sym)
-    open_px = ctx.btc_open if asset == "BTC" else ctx.eth_open
+    open_px = ctx.open_prices.get(asset, 0)
     delta = spot - open_px if open_px > 0 else 0
 
     # Determine token
@@ -262,7 +389,7 @@ def execute_trade(state, strat_key, ctx, asset, side, ask_price):
 
     # Order filled — record it
     order_id = resp.get("orderID", "")
-    actual_cost = round(shares * ask_price, 2)  # what we actually paid
+    actual_cost = round(shares * ask_price, 2)
     trade = {
         "strategy": strat_key,
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -287,7 +414,7 @@ def execute_trade(state, strat_key, ctx, asset, side, ask_price):
 
     print(f"\n  >>> LIVE TRADE [{strat_name}] {asset} {side} @ ${ask_price:.3f}")
     print(f"      Order: {order_id[:16]}...")
-    print(f"      Cost: ${actual_cost:.2f} | Shares: {shares} | "
+    print(f"      Bet: ${actual_cost:.2f} | Shares: {shares} | "
           f"Profit if win: ${shares - actual_cost:.2f}")
     print(f"      {asset} open: ${open_px:,.2f} | now: ${spot:,.2f} | "
           f"delta: ${delta:+,.2f}")
@@ -300,38 +427,62 @@ def execute_trade(state, strat_key, ctx, asset, side, ask_price):
 # ═══════════════════════════════════════════════════════════════
 
 def check_s1(state, ctx, asset, up_ask, dn_ask):
-    """Strategy 1: Buy whichever side is >= $0.98 in last 15 seconds."""
+    """Strategy 1: Enter $0.85-$0.95 when ML prob > ask + 3% edge."""
     s = state["s1"]
-    if s["bankroll"] < BET_MIN or s["bankroll"] < KILL_SWITCH_MIN:
+    if s["bankroll"] < BET_SIZE or s["bankroll"] < KILL_SWITCH_MIN:
         return
 
-    if MIN_ASK <= up_ask <= MAX_ASK and (asset, "UP") not in ctx.s1_traded:
-        execute_trade(state, "s1", ctx, asset, "UP", up_ask)
-        ctx.s1_traded.add((asset, "UP"))
-    elif MIN_ASK <= dn_ask <= MAX_ASK and (asset, "DOWN") not in ctx.s1_traded:
-        execute_trade(state, "s1", ctx, asset, "DOWN", dn_ask)
-        ctx.s1_traded.add((asset, "DOWN"))
+    ens_prob = estimate_probability(asset)
+
+    # UP side in range — require ML edge
+    if (MIN_ASK <= up_ask <= MAX_ASK
+            and (asset, "UP") not in ctx.s1_traded):
+        edge = ens_prob - up_ask
+        if edge >= MIN_EDGE:
+            print(f"  [EDGE] S1 {asset} UP: ML={ens_prob:.3f} ask={up_ask:.3f} edge={edge:.3f}")
+            execute_trade(state, "s1", ctx, asset, "UP", up_ask)
+            ctx.s1_traded.add((asset, "UP"))
+            return
+
+    # DOWN side in range — require ML edge
+    if (MIN_ASK <= dn_ask <= MAX_ASK
+            and (asset, "DOWN") not in ctx.s1_traded):
+        dn_prob = 1 - ens_prob
+        edge = dn_prob - dn_ask
+        if edge >= MIN_EDGE:
+            print(f"  [EDGE] S1 {asset} DOWN: ML={dn_prob:.3f} ask={dn_ask:.3f} edge={edge:.3f}")
+            execute_trade(state, "s1", ctx, asset, "DOWN", dn_ask)
+            ctx.s1_traded.add((asset, "DOWN"))
 
 
 def check_s2(state, ctx, up_ask, dn_ask, btc_now):
-    """Strategy 2: Buy at $0.98 when BTC is $25+ from open in last 30s."""
+    """Strategy 2: BTC $25+ confirmation + ML edge at $0.85-$0.95."""
     s = state["s2"]
-    if s["bankroll"] < BET_MIN or s["bankroll"] < KILL_SWITCH_MIN:
+    if s["bankroll"] < BET_SIZE or s["bankroll"] < KILL_SWITCH_MIN:
         return
-    if ctx.btc_open <= 0 or btc_now <= 0:
+    btc_open = ctx.open_prices.get("BTC", 0)
+    if btc_open <= 0 or btc_now <= 0:
         return
 
-    delta = btc_now - ctx.btc_open
+    delta = btc_now - btc_open
     if abs(delta) < BTC_BUFFER:
         return
 
-    # Buy the side matching the price direction
+    ens_prob = estimate_probability("BTC")
+
+    # BTC confirms UP + ask in range + ML edge
     if delta > 0 and MIN_ASK <= up_ask <= MAX_ASK:
-        execute_trade(state, "s2", ctx, "BTC", "UP", up_ask)
-        ctx.s2_traded = True
+        edge = ens_prob - up_ask
+        if edge >= MIN_EDGE:
+            execute_trade(state, "s2", ctx, "BTC", "UP", up_ask)
+            ctx.s2_traded = True
+    # BTC confirms DOWN + ask in range + ML edge
     elif delta < 0 and MIN_ASK <= dn_ask <= MAX_ASK:
-        execute_trade(state, "s2", ctx, "BTC", "DOWN", dn_ask)
-        ctx.s2_traded = True
+        dn_prob = 1 - ens_prob
+        edge = dn_prob - dn_ask
+        if edge >= MIN_EDGE:
+            execute_trade(state, "s2", ctx, "BTC", "DOWN", dn_ask)
+            ctx.s2_traded = True
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -401,10 +552,12 @@ def resolve_trades(state, now):
 
 def print_banner():
     print("=" * 70)
-    print("  SCALP BOT — LIVE TRADING")
-    print("  S1: Last 15 Seconds (BTC+ETH)  |  S2: 30s+BTC Confirm (BTC)")
-    tiers_str = " / ".join(f"≥${t:.0f}→${s:.0f}" for t, s in BET_TIERS)
-    print(f"  Bet tiers: {tiers_str}  |  Min ask: ${MIN_ASK:.2f}")
+    print("  SCALP BOT v4 — ML EDGE at $0.85-$0.95")
+    print("  S1: ML Edge (BTC/ETH/SOL/XRP)  |  S2: ML Edge+BTC Confirm")
+    print(f"  Bet: ${BET_SIZE:.2f} fixed  |  Ask: ${MIN_ASK:.2f}-${MAX_ASK:.2f}  |  "
+          f"Min edge: {MIN_EDGE:.0%}")
+    print(f"  S1: last {S1_LEAD}s  |  S2: last {S2_LEAD}s  |  "
+          f"Ensemble: {ENSEMBLE_ML_W:.0%} ML + {ENSEMBLE_H_W:.0%} Heuristic")
     print(f"  Bankroll: ${STARTING_BANKROLL:,.2f} / strategy")
     print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 70)
@@ -445,6 +598,7 @@ def run():
     init_log()
     state = load_state()
     print_banner()
+    init_models()
 
     current_window_ts = None
     ctx = None
@@ -463,23 +617,25 @@ def run():
                     print_dashboard(state)
                     save_state(state)
                     redeem_positions()
+                    retrain_models(state["windows"])
 
                 current_window_ts = window_ts
                 ctx = WindowCtx(window_ts=window_ts, window_end=window_end)
 
-                # Capture open prices
-                ctx.btc_open = get_binance_price("BTCUSDT")
-                ctx.eth_open = get_binance_price("ETHUSDT")
+                # Refresh feature cache at window open (~270s before scalp zone)
+                refresh_features()
 
-                # Discover markets
-                for asset in ["BTC", "ETH"]:
+                # Capture open prices and discover markets for all assets
+                for asset in S1_ASSETS:
+                    sym = BINANCE_MAP[asset]
+                    ctx.open_prices[asset] = get_binance_price(sym)
                     mkt = discover_market(asset, window_ts)
                     if mkt:
                         ctx.markets[asset] = mkt
 
                 found = list(ctx.markets.keys())
-                print(f"\n  [WINDOW {window_ts}] BTC=${ctx.btc_open:,.2f}  "
-                      f"ETH=${ctx.eth_open:,.2f}  Markets: {found}")
+                prices_str = "  ".join(f"{a}=${ctx.open_prices.get(a, 0):,.2f}" for a in found)
+                print(f"\n  [WINDOW {window_ts}] {prices_str}  Markets: {found}")
                 print(f"  [WINDOW] Scalp zone in {secs_left - S2_LEAD:.0f}s  "
                       f"(close at {datetime.fromtimestamp(window_end, tz=timezone.utc).strftime('%H:%M:%S')} UTC)")
 
@@ -495,7 +651,7 @@ def run():
             # ── SCALP ZONE: poll every 1.5s ──
             poll_parts = [f"  [{secs_left:5.1f}s]"]
 
-            for asset in ["BTC", "ETH"]:
+            for asset in S1_ASSETS:
                 if asset not in ctx.markets:
                     continue
                 mkt = ctx.markets[asset]

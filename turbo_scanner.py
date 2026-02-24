@@ -112,8 +112,9 @@ def turbo_worker(wid):
                 return
 
             key_start = base + offset
+            # SSE variant is ~30% faster than non-SSE
             # Correct arg order: (num, addr_type, iscompressed, pvk_int)
-            blob = ice.privatekey_loop_h160(BATCH, 0, True, key_start)
+            blob = ice.privatekey_loop_h160_sse(BATCH, 0, True, key_start)
 
             # Alignment-safe search
             key_offset = scan_blob_for_target(blob, TARGET_H160, BATCH)

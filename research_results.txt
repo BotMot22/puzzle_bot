@@ -1,0 +1,295 @@
+================================================================================
+BITCOIN PUZZLE #71 — BSGS/KANGAROO WITHOUT PUBLIC KEY RESEARCH
+================================================================================
+Date: 2026-02-24
+Target: 1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU
+H160:   f6f5431d25bbf7b12e8add9af5e3475c44a0a5b8
+Range:  0x400000000000000000 to 0x7FFFFFFFFFFFFFFFFF (2^70 to 2^71-1)
+
+================================================================================
+EXECUTIVE SUMMARY
+================================================================================
+
+BSGS and Pollard's Kangaroo CANNOT be used to solve Puzzle #71 without the
+public key. Both algorithms fundamentally require the target public key (EC
+point) as input. The public key for puzzle #71 has NOT been exposed on the
+blockchain (no spend transactions from the address).
+
+Without the public key, the ONLY viable approach is brute force hash160
+comparison, which requires O(2^70) operations. At our best measured speed
+(~8 Mkeys/s with keyhunt), this would take ~4.7 million years.
+
+================================================================================
+1. BSGS (BABY-STEP GIANT-STEP) ANALYSIS
+================================================================================
+
+Standard Algorithm:
+  Given: P = k*G (public key P, generator G)
+  Find: k in range [a, b]
+
+  Baby steps: Store {j*G : j = 0, ..., m-1}  where m = ceil(sqrt(b-a))
+  Giant steps: Compute P - i*m*G for i = 0, 1, 2, ...
+  Match: If P - i*m*G == j*G, then k = i*m + j
+
+  Complexity: O(sqrt(n)) time and space
+  For 2^70 range: sqrt(2^70) = 2^35 ~ 34 billion operations
+
+WHY IT FAILS WITHOUT PUBLIC KEY:
+  The giant step phase computes P - i*m*G. Without P (the public key),
+  this computation is impossible. There is no algebraic substitute.
+
+  "Modified BSGS with H160":
+  - Idea: Store {H160(j*G)} as baby steps, check giant steps as H160 values
+  - Problem: Giant step requires H160((k-i*m)*G) = H160(P - i*m*G)
+  - We can't compute this because we don't know P OR k
+  - Storing H160 for baby steps is just sequential brute force
+
+CONFIRMED BY CODE:
+  keyhunt's BSGS mode (-m bsgs) requires public key input files
+  (66 or 130 hex character compressed/uncompressed public keys).
+  Passing an address file to BSGS mode gives: "There is no valid data"
+
+================================================================================
+2. POLLARD'S KANGAROO (LAMBDA METHOD) ANALYSIS
+================================================================================
+
+Standard Algorithm:
+  Given: P = k*G, find k in [a, b]
+
+  Tame kangaroo: Start at b*G, random walk using deterministic jumps
+  Wild kangaroo: Start at P (target), same random walk
+  Collision between tame and wild reveals k
+
+  Complexity: O(sqrt(n)) time, O(1) space
+
+WHY IT FAILS WITHOUT PUBLIC KEY:
+  The wild kangaroo starts at point P (the target public key).
+  Without P, there is no starting point for the wild kangaroo.
+  The algorithm fundamentally requires an EC point to operate on.
+
+================================================================================
+3. ICELAND SECP256K1 BSGS FUNCTIONS — DOCUMENTATION
+================================================================================
+
+All functions documented from iceland secp256k1 library:
+
+ice.create_baby_table(start_value, end_value)
+  Creates a baby step lookup table for the range [start, end].
+  Returns: bytes (raw table data)
+  NOTE: Operates on EC points, requires public key for giant step phase.
+
+ice.create_bsgs_bloom_mcpu(mcpu, total_entries, _fp=1e-06)
+  Creates a multi-threaded bloom filter for the baby step table.
+  Parameters: mcpu=cores, total_entries=number of baby steps, _fp=false positive rate
+
+ice.bsgs_2nd_check_prepare(bP_elem=2000000000)
+  Prepares the secondary check table for BSGS verification.
+
+ice.bsgs_2nd_check(pubkey_bytes, z1_int)
+  Checks if a specific public key (65 bytes, uncompressed) has a private key
+  in the precomputed baby step range.
+  REQUIRES: Public key as input (65 bytes uncompressed)
+
+ice.bsgs_2nd_check_mcpu(concat_pubkey_bytes, z1_int, mcpu=4)
+  Multi-core version of bsgs_2nd_check.
+  Input: concatenated 65-byte uncompressed public keys
+  Output: 32-byte private keys per match, found_array with 0/1 flags
+  REQUIRES: Public keys as input
+
+ice.bsgs_xor_create_mcpu(mcpu, total_entries, _fp=1e-06)
+  Creates XOR-based filter for BSGS (alternative to bloom filter).
+
+CONCLUSION: All BSGS functions in iceland operate on EC public keys.
+None can work with just an h160/address.
+
+================================================================================
+4. BLOOM FILTER APPROACH FOR H160 MATCHING
+================================================================================
+
+Tested using iceland bloom filter functions for h160 comparison:
+
+  ice.Fill_in_bloom([target_h160], fp=1e-12)
+    Returns: (bits=64, hashes=44, filter=8bytes, fp, count)
+
+  ice.bloom_check_add_mcpu(buffer, count, item_size=20, mcpu, mode, bits, hashes, filter)
+    Batch bloom filter check/add operations
+
+Benchmark Results (1M keys):
+  H160 generation (privatekey_loop_h160): 343,283 keys/sec
+  Bloom check (14.4M checks/sec): Nearly free vs generation cost
+  bytes.find() comparison: 299M/sec (also negligible)
+
+BOTTLENECK: H160 generation is 99%+ of the work. The comparison method
+(bloom, binary search, memcmp, bytes.find) is irrelevant.
+
+Bloom filter with 1 item at 64 bits gave 0.38% false positive rate.
+For a single target, direct byte comparison is simpler and equally fast.
+
+================================================================================
+5. POINT SEQUENTIAL INCREMENT PIPELINE
+================================================================================
+
+Tested: ice.point_sequential_increment + per-key pubkey_to_h160
+
+  point_sequential_increment: 1,423,714 points/sec (EC addition only, very fast)
+  Individual pubkey_to_h160:  253,559 hashes/sec (bottleneck)
+  Combined pipeline:          215,210 keys/sec
+
+  privatekey_loop_h160:       339,695 keys/sec (better, all in C)
+  privatekey_loop_h160_sse:   468,745 keys/sec (SSE optimized, best Python-based)
+
+The built-in privatekey_loop_h160_sse is faster because it avoids Python overhead
+and performs the EC scalar mult + hash160 in a tight C loop with SSE instructions.
+
+================================================================================
+6. KEYHUNT BENCHMARK RESULTS (ACTUALLY MEASURED)
+================================================================================
+
+Built from: https://github.com/albertobsd/keyhunt (commit latest)
+Compiled with: g++ -O3 -march=native -mssse3 (default Makefile)
+CPU: 4 cores
+
+Mode: address (base58 address input)
+  keyhunt -m address -f address.txt -b 71 -l compress -R -t 4
+  Speed: ~3.2 Mkeys/s (4 threads)
+
+  With endomorphism (-e):
+  Speed: ~6.7-8.1 Mkeys/s (4 threads)
+  Endomorphism checks 6 h160 per EC point (3 endomorphism variants x 2 y-parity)
+  This is the FASTEST measured mode on this hardware.
+
+Mode: rmd160 (raw hash160 input)
+  keyhunt -m rmd160 -f target.rmd -b 71 -l compress -R -t 4
+  Speed: ~5.9 Mkeys/s (4 threads)
+
+  With endomorphism (-e):
+  Speed: ~6.5 Mkeys/s (4 threads)
+
+Mode: bsgs (Baby-step Giant-step)
+  REQUIRES PUBLIC KEY - fails with address input:
+  "There is no valid data in the file"
+  This mode reads 66/130 character hex public keys only.
+
+C Scanner (our custom libsecp256k1-based):
+  c_scanner.c with EC point addition (secp256k1_ec_pubkey_combine)
+  Speed: ~0.41 Mkeys/s (4 threads)
+  20x SLOWER than keyhunt because keyhunt uses batch SSE SHA256+RIPEMD160
+
+================================================================================
+7. WHY KEYHUNT IS FAST (TECHNICAL DETAILS)
+================================================================================
+
+keyhunt achieves ~8 Mkeys/s through several optimizations:
+
+a) GROUP OPERATIONS: Processes points in groups of 4 using Montgomery batch
+   inversion trick (1 modular inverse per 4 point additions instead of 4)
+
+b) SSE HASH: GetHash160_fromX processes 4 public keys at once using SSE
+   optimized SHA256 and RIPEMD160 (hash/sha256_sse.cpp, hash/ripemd160_sse.cpp)
+
+c) X-ONLY HASHING: GetHash160_fromX only needs the x-coordinate and parity
+   byte, avoiding full point serialization
+
+d) ENDOMORPHISM: For each point P=(x,y), secp256k1 endomorphism provides:
+   - P = (x, y)          -> check 02|x and 03|x
+   - beta*P = (beta*x, y)  -> check 02|beta*x and 03|beta*x
+   - beta2*P = (beta2*x, y) -> check 02|beta2*x and 03|beta2*x
+   Total: 6 address checks per 1 EC point computation
+   Effective speedup: ~3x over non-endomorphism
+
+e) BLOOM FILTER: Uses multi-level bloom filters for fast negative filtering
+   before binary search confirmation
+
+================================================================================
+8. HASH160 COLLISION/PREIMAGE ANALYSIS
+================================================================================
+
+RIPEMD160(SHA256(pubkey)) = 160-bit output
+
+Birthday collision: ~2^80 operations for ANY collision
+Preimage (find input for specific output): ~2^160 operations
+
+Our situation: We need a PREIMAGE — find k such that H160(k*G) = target
+This is NOT a collision problem. It's a preimage search.
+
+The 2^70 keyspace is much smaller than 2^160, so:
+  - Every key in range produces a unique h160 (with overwhelming probability)
+  - There are no mathematical shortcuts — each candidate must be fully hashed
+  - The hash function destroys all algebraic structure of the EC group
+
+No known weaknesses in SHA256 or RIPEMD160 help with this.
+The NSA, academic cryptographers, and the entire crypto community have
+analyzed these functions extensively. No practical preimage attacks exist.
+
+================================================================================
+9. PUBLIC KEY STATUS FOR PUZZLE #71
+================================================================================
+
+Confirmed via web research:
+  - Puzzle #71 address 1PWo3JeB9jrGwfHDNpdGK54CRas7fsVzXU is UNSOLVED
+  - The public key is NOT exposed (no spend transactions from this address)
+  - Only puzzles that have been SOLVED have their public keys known
+    (because solving requires spending, which reveals the pubkey)
+  - Sources: secretscan.org, btcpuzzle.info, privatekeys.pw
+
+The puzzle creator deliberately does NOT reveal public keys for unsolved puzzles.
+This is what makes puzzles beyond #66 fundamentally harder:
+  - With public key: O(2^35) via BSGS/Kangaroo — hours on a single PC
+  - Without public key: O(2^70) via brute force — millions of years on a single PC
+
+================================================================================
+10. SPEED COMPARISON SUMMARY (ALL MEASURED)
+================================================================================
+
+Method                                    | Keys/sec    | Time to solve
+------------------------------------------|-------------|------------------
+iceland privatekey_loop_h160 (1 core)     |    340K/s   | 110M years
+iceland privatekey_loop_h160_sse (1 core) |    469K/s   |  80M years
+Our C scanner (4 cores)                   |    410K/s   |  91M years
+keyhunt address mode (4 cores)            |    3.2M/s   |  11.7M years
+keyhunt rmd160 mode (4 cores)             |    5.9M/s   |   6.3M years
+keyhunt address+endo (4 cores, BEST)      |    8.1M/s   |   4.6M years
+btcpuzzle.info pool (REFERENCE)           |  195.5G/s   |   191 years
+
+All "time to solve" assumes exhaustive search of entire 2^70 range.
+Expected time (50% probability) is half of these values.
+
+================================================================================
+11. CONCLUSIONS AND RECOMMENDATIONS
+================================================================================
+
+DEFINITIVE ANSWERS:
+
+1. CAN BSGS SOLVE PUZZLE #71 WITHOUT PUBLIC KEY?
+   NO. Mathematically impossible. BSGS requires the target EC point.
+
+2. CAN POLLARD'S KANGAROO SOLVE IT WITHOUT PUBLIC KEY?
+   NO. Mathematically impossible. Kangaroo requires the target EC point.
+
+3. CAN KEYHUNT'S BSGS MODE HELP?
+   NO. Despite the name, keyhunt's -m bsgs mode also requires public key
+   input. It does NOT work with addresses.
+
+4. WHAT IS THE FASTEST ADDRESS-BASED SEARCH?
+   keyhunt -m address -e (endomorphism) at ~8 Mkeys/s on 4 cores.
+   This is pure brute force, just very well optimized.
+
+5. IS THE PUZZLE SOLVABLE ON THIS HARDWARE?
+   NO. At 8 Mkeys/s, exhaustive search takes 4.7 million years.
+   Even with 50% expected time, that's 2.3 million years.
+
+6. HOW COULD IT BE SOLVED?
+   a) If the public key is revealed: BSGS/Kangaroo solves in hours
+   b) Join a GPU pool (btcpuzzle.info): ~191 years at current pool rate
+   c) Massive GPU cluster (~1,250 RTX 4090s): ~10 years expected
+   d) Luck: Random search could find it on the first try (prob: 2^-70)
+
+7. BEST STRATEGY FOR THIS MACHINE:
+   Run keyhunt with endomorphism as a lottery ticket while focusing effort
+   on monitoring for public key exposure. If anyone starts a spend
+   transaction from this address, the public key becomes visible in the
+   mempool, and BSGS/Kangaroo can solve it in hours.
+
+================================================================================
+END OF RESEARCH RESULTS
+================================================================================

@@ -109,9 +109,12 @@ def redeem_positions():
 # ═══════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
-BET_SIZE_LOW = 5.00
-BET_SIZE_HIGH = 10.00
-BET_UPGRADE_THRESHOLD = 20.00  # per-strategy bankroll needed to unlock $10 bets
+# Dynamic bet sizing tiers (per-strategy bankroll thresholds)
+BET_TIERS = [
+    (30.0, 15.00),   # bankroll >= $30 → $15 bets
+    (20.0, 10.00),   # bankroll >= $20 → $10 bets
+    (0.0,   5.00),   # default → $5 bets
+]
 MIN_ASK = 0.98
 MAX_ASK = 0.995   # Don't buy at $1.00 — zero profit. Allows $0.98 and $0.99.
 BTC_BUFFER = 25.0
@@ -123,7 +126,7 @@ WINDOW_SECS = 300
 S1_ASSETS = ["BTC", "ETH"]
 S2_ASSETS = ["BTC"]
 
-STARTING_BANKROLL = 13.35  # $26.71 wallet split across 2 strategies
+STARTING_BANKROLL = 30.85  # $61.71 wallet split across 2 strategies
 KILL_SWITCH_MIN = 5.00   # Stop trading if bankroll drops below this
 LOG_FILE = "data/scalp_trades.csv"
 STATE_FILE = "data/scalp_state.json"
@@ -218,8 +221,8 @@ def log_trade(trade: dict):
 def execute_trade(state, strat_key, ctx, asset, side, ask_price):
     """LIVE trade: place real FOK order on Polymarket CLOB."""
     s = state[strat_key]
-    # Dynamic bet sizing: $5 base, $10 when bankroll > threshold
-    bet_size = BET_SIZE_HIGH if s["bankroll"] >= BET_UPGRADE_THRESHOLD else BET_SIZE_LOW
+    # Dynamic bet sizing based on bankroll tier
+    bet_size = next(amt for thresh, amt in BET_TIERS if s["bankroll"] >= thresh)
     # CLOB requires clean decimals — use integer shares to avoid floating point issues
     ask_price = round(ask_price, 2)
     shares = int(bet_size / ask_price)  # floor to whole shares, keeps maker_amt clean
@@ -294,7 +297,7 @@ def execute_trade(state, strat_key, ctx, asset, side, ask_price):
 def check_s1(state, ctx, asset, up_ask, dn_ask):
     """Strategy 1: Buy whichever side is >= $0.98 in last 15 seconds."""
     s = state["s1"]
-    if s["bankroll"] < BET_SIZE_LOW or s["bankroll"] < KILL_SWITCH_MIN:
+    if s["bankroll"] < BET_TIERS[-1][1] or s["bankroll"] < KILL_SWITCH_MIN:
         return
 
     if MIN_ASK <= up_ask <= MAX_ASK and (asset, "UP") not in ctx.s1_traded:
@@ -308,7 +311,7 @@ def check_s1(state, ctx, asset, up_ask, dn_ask):
 def check_s2(state, ctx, up_ask, dn_ask, btc_now):
     """Strategy 2: Buy at $0.98 when BTC is $25+ from open in last 30s."""
     s = state["s2"]
-    if s["bankroll"] < BET_SIZE_LOW or s["bankroll"] < KILL_SWITCH_MIN:
+    if s["bankroll"] < BET_TIERS[-1][1] or s["bankroll"] < KILL_SWITCH_MIN:
         return
     if ctx.btc_open <= 0 or btc_now <= 0:
         return
@@ -395,7 +398,7 @@ def print_banner():
     print("=" * 70)
     print("  SCALP BOT — LIVE TRADING")
     print("  S1: Last 15 Seconds (BTC+ETH)  |  S2: 30s+BTC Confirm (BTC)")
-    print(f"  Bet: ${BET_SIZE_LOW:.0f}/${BET_SIZE_HIGH:.0f} dynamic  |  Min ask: ${MIN_ASK:.2f}")
+    print(f"  Bet: ${BET_TIERS[-1][1]:.0f}-${BET_TIERS[0][1]:.0f} dynamic  |  Min ask: ${MIN_ASK:.2f}")
     print(f"  Bankroll: ${STARTING_BANKROLL:,.2f} / strategy")
     print(f"  {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("=" * 70)

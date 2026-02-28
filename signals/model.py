@@ -122,8 +122,8 @@ class HeuristicScorer:
         avg_score = scores / count
         prob_up = 1 / (1 + np.exp(-avg_score))  # sigmoid
 
-        # Shrink toward 0.5 (humility adjustment — we're not that smart)
-        prob_up = 0.5 + (prob_up - 0.5) * 0.6
+        # Shrink toward 0.5 (humility adjustment — mild)
+        prob_up = 0.5 + (prob_up - 0.5) * 0.85
 
         return np.column_stack([1 - prob_up, prob_up])
 
@@ -151,7 +151,7 @@ class QuantModel:
         X_scaled = self.scaler.fit_transform(X)
 
         self.model = LogisticRegression(
-            C=0.1,            # strong regularization (prevent overfitting)
+            C=1.0,            # moderate regularization (allow stronger signals)
             penalty="l2",
             max_iter=1000,
             class_weight="balanced",  # handle class imbalance

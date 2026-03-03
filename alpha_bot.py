@@ -90,7 +90,7 @@ CTF_PARENT = b'\x00' * 32
 # CONFIG
 # ═══════════════════════════════════════════════════════════════
 
-PAPER_MODE = True  # Set True for dry-run
+PAPER_MODE = False  # LIVE MODE
 
 # -- Strategy toggles --
 CRYPTO_SPEED_ENABLED = True
@@ -102,15 +102,15 @@ CRYPTO_ASSETS = ["bitcoin", "ethereum", "solana"]
 BINANCE_MAP = {"bitcoin": "BTCUSDT", "ethereum": "ETHUSDT", "solana": "SOLUSDT"}
 # Min confidence to trade (how far the direction is locked in)
 CRYPTO_MIN_CONFIDENCE = 0.70  # 70% of window elapsed with clear direction
-CRYPTO_MAX_ASK = 0.92         # Don't pay more than 92c (was BoneReader buying at 99c)
+CRYPTO_MAX_ASK = 0.45         # Tightened from 0.92 — never overpay
 CRYPTO_MIN_ASK = 0.01         # Will buy as low as 1c if edge is extreme
-CRYPTO_BET_SIZE = 25.00       # $25 per crypto trade with $1K bankroll
+CRYPTO_BET_SIZE = 10.00       # $10 per crypto trade (conservative for live)
 
 # -- NBA pace config --
-NBA_MIN_PACE_EDGE = 8.0       # Points: pace must be 8+ pts away from O/U line
-NBA_MIN_GAME_MINUTES = 24     # At least halftime (24 min played of 48)
-NBA_MAX_ASK = 0.55            # Buy at 55c max (bcda buys at ~48c)
-NBA_BET_SIZE = 35.00          # $35 per NBA trade
+NBA_MIN_PACE_EDGE = 10.0      # Tightened from 8 — need stronger edge for live
+NBA_MIN_GAME_MINUTES = 30     # Tightened from 24 — deeper into game = safer
+NBA_MAX_ASK = 0.50            # Tightened from 0.55
+NBA_BET_SIZE = 15.00          # $15 per NBA trade (conservative for live)
 
 # -- Whale mirror config --
 WHALE_WALLETS = {
@@ -121,14 +121,14 @@ WHALE_WALLETS = {
     "768543265":   "0x5da48936d61eb18d66ca5fdd32ba2d2ba19be203",
 }
 WHALE_MIN_TRADE_SIZE = 500    # Only mirror whale trades > $500
-WHALE_MIRROR_SIZE = 15.00     # Our mirror bet size
-WHALE_MAX_ASK = 0.60          # Don't mirror if ask > 60c (whales buy at 45-55c)
+WHALE_MIRROR_SIZE = 10.00     # $10 mirror bet (conservative for live)
+WHALE_MAX_ASK = 0.55          # Tightened from 0.60
 
 # -- Risk management --
-BET_SIZE = 25.00
-KILL_SWITCH_MIN = 50.00       # Stop at $50 remaining
-MAX_DAILY_TRADES = 150
-MAX_PENDING = 40
+BET_SIZE = 10.00
+KILL_SWITCH_MIN = 25.00       # Stop at $25 remaining (tighter for live)
+MAX_DAILY_TRADES = 75         # Halved from 150 — less volume, more selective
+MAX_PENDING = 20              # Halved from 40 — less capital deployed at once
 POLL_INTERVAL = 30            # Main loop interval (seconds)
 
 # -- State --
@@ -456,45 +456,54 @@ def evaluate_crypto_market(mkt):
             momentum_5m = (price_now - price_5m_ago) / price_5m_ago * 100
             momentum_1m = (price_now - price_1m_ago) / price_1m_ago * 100
 
-            # Strong momentum = price clearly moving in one direction
-            spot_says_up = momentum_5m > 0.05 and momentum_1m > 0  # >0.05% in 5 min, still rising
-            spot_says_down = momentum_5m < -0.05 and momentum_1m < 0
+            # LIVE: require stronger momentum + 1m confirmation to avoid whipsaws
+            spot_says_up = momentum_5m > 0.15 and momentum_1m > 0.05
+            spot_says_down = momentum_5m < -0.15 and momentum_1m < -0.05
         else:
             return None
     except Exception:
         return None
 
-    # Winner55555 model: place LIMIT ORDERS at target prices based on momentum
-    # The orderbooks are thin (1c/99c). Real trades happen via limit orders.
-    # We place limit buys at 40-55c and wait for fills.
+    # CLOB confirmation: if CLOB midpoint disagrees with momentum, skip
+    clob_agrees_up = clob_says_up
+    clob_agrees_down = not clob_says_up
 
-    if spot_says_up:
+    # LIVE: use actual best ask but cap max entry price
+    # Buy at real ask so orders actually fill, but never overpay
+    MAX_ENTRY_STRONG = 0.50    # Cap for strong signals
+    MAX_ENTRY_MODERATE = 0.42  # Cap for moderate signals
+    if spot_says_up and clob_agrees_up:
         side = "Up"
         token_id = up_token
-        # Place limit at our target price
-        if abs(momentum_5m) > 0.15:  # Strong momentum >0.15%
-            limit_price = 0.55  # Pay more when very confident
-            tier = "STRONG_LIMIT"
-        elif abs(momentum_5m) > 0.08:
-            limit_price = 0.45
-            tier = "MODERATE_LIMIT"
+        best_ask = up_best_ask
+        if abs(momentum_5m) > 0.30:
+            tier = "STRONG"
+            max_price = MAX_ENTRY_STRONG
+        elif abs(momentum_5m) > 0.20:
+            tier = "MODERATE"
+            max_price = MAX_ENTRY_MODERATE
         else:
-            limit_price = 0.38
-            tier = "SPECULATIVE_LIMIT"
-    elif spot_says_down:
+            return None
+        if best_ask > max_price:
+            return None  # Too expensive
+        limit_price = best_ask
+    elif spot_says_down and clob_agrees_down:
         side = "Down"
         token_id = down_token
-        if abs(momentum_5m) > 0.15:
-            limit_price = 0.55
-            tier = "STRONG_LIMIT"
-        elif abs(momentum_5m) > 0.08:
-            limit_price = 0.45
-            tier = "MODERATE_LIMIT"
+        best_ask = down_best_ask
+        if abs(momentum_5m) > 0.30:
+            tier = "STRONG"
+            max_price = MAX_ENTRY_STRONG
+        elif abs(momentum_5m) > 0.20:
+            tier = "MODERATE"
+            max_price = MAX_ENTRY_MODERATE
         else:
-            limit_price = 0.38
-            tier = "SPECULATIVE_LIMIT"
+            return None
+        if best_ask > max_price:
+            return None  # Too expensive
+        limit_price = best_ask
     else:
-        return None
+        return None  # Momentum/CLOB disagree = no edge
 
     # Only trade shorter windows (5-15 min) where momentum is more predictive
     if mins_left > 15:
@@ -838,10 +847,8 @@ def run():
             state["bankroll"] = bal
     save_state(state)
 
-    # 24-hour go-live timer
     start_time = time.time()
-    GO_LIVE_AFTER_HOURS = 24
-    go_live_at = start_time + (GO_LIVE_AFTER_HOURS * 3600) if PAPER_MODE else None
+    go_live_at = None  # No auto-switch needed — already live
 
     print("=" * 66)
     print("  ALPHA BOT — Whale-Inspired Multi-Strategy Engine")
@@ -993,7 +1000,7 @@ def run():
                 try:
                     crypto_mkts = scan_crypto_markets()
                     crypto_trades_this_cycle = 0
-                    MAX_CRYPTO_PER_CYCLE = 3  # Don't over-deploy
+                    MAX_CRYPTO_PER_CYCLE = 2  # Reduced from 3 for live
                     for mkt in crypto_mkts:
                         if crypto_trades_this_cycle >= MAX_CRYPTO_PER_CYCLE:
                             break
@@ -1003,19 +1010,19 @@ def run():
                         result = evaluate_crypto_market(mkt)
                         if result:
                             side, tier, token_id, ask, question, condition_id = result
-                            size = CRYPTO_BET_SIZE
+                            # Sized by tier — conservative for live
                             if tier == "STRONG_LIMIT":
-                                size = min(20.0, state["bankroll"] * 0.15)
+                                size = min(CRYPTO_BET_SIZE, state["bankroll"] * 0.03)
                             elif tier == "MODERATE_LIMIT":
-                                size = min(15.0, state["bankroll"] * 0.10)
-                            elif tier == "SPECULATIVE_LIMIT":
-                                size = min(10.0, state["bankroll"] * 0.07)
+                                size = min(CRYPTO_BET_SIZE * 0.8, state["bankroll"] * 0.025)
+                            else:
+                                size = min(CRYPTO_BET_SIZE * 0.5, state["bankroll"] * 0.02)
 
                             if size > state["bankroll"]:
                                 continue
 
                             print(f"  [CRYPTO {tier}] {side} @ {ask:.3f} | ${size:.0f} | {question[:60]}")
-                            order = place_order(token_id, ask, size, state, order_type="GTC")
+                            order = place_order(token_id, ask, size, state, order_type="FOK")
                             if order:
                                 signals_found += 1
                                 crypto_trades_this_cycle += 1

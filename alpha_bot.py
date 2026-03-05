@@ -191,6 +191,63 @@ def log_trade(trade):
         )
 
 
+def update_csv_resolution(token_id, condition_id, resolved_ts, won, pnl, bankroll_after):
+    """Update the first matching unresolved CSV row with resolution data."""
+    if not os.path.exists(LOG_FILE):
+        return
+    rows = []
+    updated = False
+    with open(LOG_FILE, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if (not updated
+                    and row.get("token_id") == token_id
+                    and row.get("condition_id") == condition_id
+                    and not row.get("resolved")):
+                row["resolved"] = resolved_ts
+                row["won"] = "True" if won else "False"
+                row["pnl"] = f"{pnl:.4f}"
+                row["bankroll_after"] = f"{bankroll_after:.2f}"
+                updated = True
+            rows.append(row)
+    if updated:
+        with open(LOG_FILE, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+
+
+def rebuild_pending_from_csv():
+    """Rebuild pending list from CSV rows that haven't been resolved."""
+    if not os.path.exists(LOG_FILE):
+        return []
+    pending = []
+    seen = set()
+    with open(LOG_FILE, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if row.get("resolved"):
+                continue
+            cid = row.get("condition_id", "")
+            tid = row.get("token_id", "")
+            key = (tid, cid)
+            if key in seen:
+                continue
+            seen.add(key)
+            pending.append({
+                "strategy": row.get("strategy", "UNKNOWN"),
+                "token_id": tid,
+                "condition_id": cid,
+                "question": row.get("market", "")[:80],
+                "outcome": row.get("outcome", ""),
+                "entry_price": float(row.get("price", 0) or 0),
+                "size": float(row.get("size_usdc", 0) or 0),
+                "shares": float(row.get("shares", 0) or 0),
+                "timestamp": row.get("timestamp", ""),
+            })
+    return pending
+
+
 def get_usdc_balance():
     try:
         return USDC_CONTRACT.functions.balanceOf(
@@ -786,7 +843,7 @@ def place_order(token_id, price, size_usdc, state, order_type="GTC"):
     """
     Place a buy order on the CLOB.
     order_type: "FOK" (fill or kill) or "GTC" (good till cancelled - limit order)
-    Returns order dict or None.
+    Returns order dict with confirmed fill info, or None.
     """
     if PAPER_MODE:
         shares = size_usdc / price if price > 0 else 0
@@ -811,16 +868,45 @@ def place_order(token_id, price, size_usdc, state, order_type="GTC"):
         else:
             resp = clob_client.post_order(signed, OrderType.FOK)
 
-        if isinstance(resp, dict):
-            status = resp.get("status", "")
-            oid = resp.get("orderID", resp.get("id", ""))
-            if status in ("matched", "live") or "success" in str(resp).lower():
-                return {"order_id": oid, "price": price, "shares": shares,
-                        "size": size_usdc, "status": status}
-            else:
-                print(f"  [ORDER] Status: {status} | {str(resp)[:80]}")
+        if not isinstance(resp, dict):
+            print(f"  [ORDER] Unexpected response type: {type(resp)}")
+            return None
+
+        status = resp.get("status", "")
+        oid = resp.get("orderID", resp.get("id", ""))
+
+        # FOK: only "matched" means filled. "live" shouldn't happen but reject it.
+        if order_type == "FOK":
+            if status != "matched":
+                print(f"  [ORDER] FOK not matched: {status} | {str(resp)[:80]}")
                 return None
-        return None
+        else:
+            # GTC: "matched" (instant fill) or "live" (on book) are both valid
+            if status not in ("matched", "live"):
+                print(f"  [ORDER] GTC rejected: {status} | {str(resp)[:80]}")
+                return None
+
+        # Verify fill by checking order status after a brief pause
+        if oid and status == "matched":
+            time.sleep(1)
+            try:
+                order_info = clob_client.get_order(oid)
+                if isinstance(order_info, dict):
+                    filled = float(order_info.get("size_matched", 0))
+                    if filled <= 0:
+                        print(f"  [ORDER] Matched but 0 filled: {str(order_info)[:80]}")
+                        return None
+                    # Use actual filled size
+                    actual_shares = filled
+                    actual_cost = actual_shares * price
+                    return {"order_id": oid, "price": price, "shares": actual_shares,
+                            "size": actual_cost, "status": "filled"}
+            except Exception as e:
+                print(f"  [ORDER] Fill check failed ({e}), trusting matched status")
+
+        return {"order_id": oid, "price": price, "shares": shares,
+                "size": size_usdc, "status": status}
+
     except Exception as e:
         print(f"  [ORDER ERR] {str(e)[:80]}")
         return None
@@ -834,6 +920,18 @@ def run():
     global PAPER_MODE
     init_log()
     state = load_state()
+
+    # Rebuild pending from CSV if state lost its pending list
+    if not state.get("pending"):
+        rebuilt = rebuild_pending_from_csv()
+        if rebuilt:
+            state["pending"] = rebuilt
+            # Also rebuild traded_tokens to prevent re-trading
+            state["traded_tokens"] = list(set(
+                p["condition_id"] for p in rebuilt if p.get("condition_id")
+            ))
+            print(f"[REBUILD] Recovered {len(rebuilt)} pending positions from CSV")
+            save_state(state)
 
     # Sync bankroll from chain (live mode only)
     if not PAPER_MODE:
@@ -904,8 +1002,8 @@ def run():
                     go_live_at = time.time() + (24 * 3600)  # Try again in 24h
                 print("!" * 66 + "\n")
 
-            # Sync bankroll periodically (live mode only)
-            if not PAPER_MODE and cycle % 10 == 1:
+            # Sync bankroll from chain every cycle (live mode) — single source of truth
+            if not PAPER_MODE:
                 bal = get_usdc_balance()
                 if bal > 0:
                     state["bankroll"] = bal
@@ -914,7 +1012,7 @@ def run():
             if not PAPER_MODE and cycle % 10 == 0:
                 recovered = auto_redeem_positions()
                 if recovered > 0:
-                    state["bankroll"] += recovered
+                    pass  # bankroll synced from chain
                     print(f"  [AUTO-REDEEM] Recovered ${recovered:.2f}")
 
             signals_found = 0
@@ -925,67 +1023,61 @@ def run():
                 still_pending = []
                 for pos in state.get("pending", []):
                     cid = pos.get("condition_id", "")
+                    tid = pos.get("token_id", "")
                     if not cid:
                         still_pending.append(pos)
                         continue
 
-                    if PAPER_MODE:
-                        resolved = False
-                        try:
-                            mkt_data = http.get(
-                                f"https://clob.polymarket.com/markets/{cid}",
-                                timeout=5,
-                            ).json()
-                            if mkt_data.get("closed"):
-                                tokens = mkt_data.get("tokens", [])
-                                our_outcome = pos.get("outcome", "").lower()
-                                won = None
-                                for t in tokens:
-                                    if t.get("outcome", "").lower() == our_outcome:
-                                        won = t.get("winner", False)
-                                        break
-                                if won is not None:
-                                    entry = float(pos.get("size", 0))
-                                    shares = float(pos.get("shares", 0))
-                                    payout = shares if won else 0
-                                    pnl = payout - entry
-                                    if won:
-                                        state["wins"] += 1
-                                    else:
-                                        state["losses"] += 1
-                                    state["pnl"] += pnl
-                                    state["bankroll"] += payout
-                                    tag = "WIN" if won else "LOSS"
-                                    print(f"  [{tag}] {pos.get('strategy','')} {pos.get('outcome','')} | "
-                                          f"PnL: ${pnl:+.2f} | {pos.get('question','')[:50]}")
-                                    resolved = True
-                        except Exception:
-                            pass
-                        if not resolved:
+                    try:
+                        # Check market closed status via CLOB (works for both paper & live)
+                        mkt_data = http.get(
+                            f"https://clob.polymarket.com/markets/{cid}",
+                            timeout=5,
+                        ).json()
+
+                        if not mkt_data.get("closed"):
                             still_pending.append(pos)
-                    else:
-                        try:
-                            positions_resp = http.get("https://data-api.polymarket.com/positions", params={
-                                "user": WALLET, "conditionId": cid,
-                            }, timeout=10).json()
-                            if positions_resp and positions_resp[0].get("redeemable"):
-                                cur_val = float(positions_resp[0].get("currentValue", 0))
-                                entry_val = float(pos.get("size", 0))
-                                pnl = cur_val - entry_val
-                                won = cur_val > 0
-                                if won:
-                                    state["wins"] += 1
-                                else:
-                                    state["losses"] += 1
-                                state["pnl"] += pnl
-                                state["bankroll"] += cur_val
-                                status = "WIN" if won else "LOSS"
-                                print(f"  [{status}] {pos.get('strategy','')} {pos.get('outcome','')} | "
-                                      f"PnL: ${pnl:+.2f} | {pos.get('question','')[:50]}")
-                            else:
-                                still_pending.append(pos)
-                        except Exception:
+                            continue
+
+                        # Market is closed — determine winner
+                        tokens = mkt_data.get("tokens", [])
+                        our_outcome = pos.get("outcome", "").lower()
+                        won = None
+                        for t in tokens:
+                            if t.get("outcome", "").lower() == our_outcome:
+                                won = t.get("winner", False)
+                                break
+
+                        if won is None:
+                            # Could not determine winner yet
                             still_pending.append(pos)
+                            continue
+
+                        entry = float(pos.get("size", 0))
+                        shares = float(pos.get("shares", 0))
+                        payout = shares if won else 0
+                        pnl = payout - entry
+
+                        if won:
+                            state["wins"] += 1
+                        else:
+                            state["losses"] += 1
+                        state["pnl"] += pnl
+                        # bankroll synced from chain — don't manually adjust
+
+                        tag = "WIN" if won else "LOSS"
+                        print(f"  [{tag}] {pos.get('strategy','')} {pos.get('outcome','')} | "
+                              f"PnL: ${pnl:+.2f} | {pos.get('question','')[:50]}")
+
+                        # Update CSV with resolution data
+                        update_csv_resolution(
+                            tid, cid, now.isoformat(), won, pnl, state["bankroll"]
+                        )
+
+                    except Exception as e:
+                        print(f"  [RESOLVE] Err checking {cid[:16]}...: {e}")
+                        still_pending.append(pos)
+
                 state["pending"] = still_pending
             except Exception as e:
                 print(f"  [RESOLVE ERR] {e}")
@@ -1026,7 +1118,7 @@ def run():
                             if order:
                                 signals_found += 1
                                 crypto_trades_this_cycle += 1
-                                state["bankroll"] -= size
+                                # bankroll synced from chain
                                 state["daily_trades"] += 1
                                 state["trades"] += 1
                                 state["traded_tokens"].append(cid)
@@ -1083,7 +1175,7 @@ def run():
                                     order = place_order(token_id, ask, size, state)
                                     if order:
                                         signals_found += 1
-                                        state["bankroll"] -= size
+                                        # bankroll synced from chain
                                         state["daily_trades"] += 1
                                         state["trades"] += 1
                                         state["traded_tokens"].append(cid)
@@ -1159,7 +1251,7 @@ def run():
                         order = place_order(token_id, cur_ask, size, state)
                         if order:
                             signals_found += 1
-                            state["bankroll"] -= size
+                            # bankroll synced from chain
                             state["daily_trades"] += 1
                             state["trades"] += 1
                             state["traded_tokens"].append(cid)
